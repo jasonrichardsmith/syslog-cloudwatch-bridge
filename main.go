@@ -3,25 +3,27 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"time"
 	"sort"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"github.com/satori/go.uuid"
-
+	"github.com/aws/aws-sdk-go/service/ec2"
+	uuid "github.com/satori/go.uuid"
 	"gopkg.in/mcuadros/go-syslog.v2"
 	"gopkg.in/mcuadros/go-syslog.v2/format"
 )
 
 var port = os.Getenv("PORT")
 var logGroupName = os.Getenv("LOG_GROUP_NAME")
-var streamName, err = uuid.NewV4()
+var streamName = uuid.NewV4()
 var sequenceToken = ""
 
 var (
@@ -36,7 +38,11 @@ func init() {
 
 func main() {
 	if logGroupName == "" {
-		log.Fatal("LOG_GROUP_NAME must be specified")
+		var err error
+		logGroupName, err = getLogGroup()
+		if err != nil {
+			log.Fatal("LOG_GROUP_NAME must be specified")
+		}
 	}
 
 	if port == "" {
@@ -66,19 +72,53 @@ func main() {
 		loglist := make([]format.LogParts, 0)
 		for {
 			select {
-				case <- ticker.C:
-					if len(loglist) <= 0 {
-						continue
-					}
-					sendToCloudWatch(loglist)
-					loglist = make([]format.LogParts, 0)
-				case logParts := <- channel:
-					loglist = append(loglist, logParts)
+			case <-ticker.C:
+				if len(loglist) <= 0 {
+					continue
+				}
+				sendToCloudWatch(loglist)
+				loglist = make([]format.LogParts, 0)
+			case logParts := <-channel:
+				loglist = append(loglist, logParts)
 			}
 		}
 	}(channel)
 
 	server.Wait()
+}
+
+func getLogGroup() (string, error) {
+
+	ec2meta := ec2metadata.New(session.New())
+	identity, err := ec2meta.GetInstanceIdentityDocument()
+	if err != nil {
+		return "", fmt.Errorf("GetInstanceIdentityDocument failed: %s", err)
+	}
+	fmt.Printf("Received %s in region %s", identity.InstanceID, identity.Region)
+	svc := ec2.New(session.New(), &aws.Config{
+		Region: &identity.Region,
+	})
+
+	var resp *ec2.DescribeInstancesOutput
+	resp, err = svc.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: []*string{&identity.InstanceID},
+	})
+	if err != nil {
+		return "", fmt.Errorf("GetInstance failed: %s", err)
+	}
+
+	for _, r := range resp.Reservations {
+		for _, inst := range r.Instances {
+			for _, tag := range inst.Tags {
+				if *tag.Key == "loggroup" {
+					return *tag.Value, nil
+				}
+			}
+
+		}
+	}
+	return "", errors.New("No LogGroupName found")
+
 }
 
 func sendToCloudWatch(buffer []format.LogParts) {
@@ -92,7 +132,9 @@ func sendToCloudWatch(buffer []format.LogParts) {
 		LogStreamName: aws.String(streamName.String()),
 	}
 
-	sort.Slice(buffer, func(i, j int) bool { return buffer[i]["timestamp"].(time.Time).Before(buffer[j]["timestamp"].(time.Time)) })
+	sort.Slice(buffer, func(i, j int) bool {
+		return buffer[i]["timestamp"].(time.Time).Before(buffer[j]["timestamp"].(time.Time))
+	})
 
 	for _, logPart := range buffer {
 		params.LogEvents = append(params.LogEvents, &cloudwatchlogs.InputLogEvent{
